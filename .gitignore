@@ -1,0 +1,7 @@
+target/
+
+.env
+*.exe
+.idea/
+.vscode/
+.DS_Store

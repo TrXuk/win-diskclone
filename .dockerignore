@@ -1,0 +1,16 @@
+# Build artifacts (we mount target as volume)
+target/
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
