@@ -1,0 +1,11 @@
+# Static linking for Windows - no external CRT DLL
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# GNU target (used for Docker/cross-compilation from Linux)
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-static-libgcc"]

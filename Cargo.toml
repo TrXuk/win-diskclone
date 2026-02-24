@@ -1,0 +1,29 @@
+[workspace]
+members = ["diskclone-visual"]
+
+[package]
+name = "diskclone"
+version = "0.1.0"
+edition = "2021"
+description = "Windows bootable disk clone via VSS shadow copy with SSH/local output"
+license = "MIT OR Apache-2.0"
+authors = ["Matt - Vim and Tonic <https://www.youtube.com/@VimAndTonic>"]
+
+[dependencies]
+volume_shadow_copy = { git = "https://github.com/Lej77/volume_shadow_copy.git" }
+widestring = "0.4"
+winapi = { version = "0.3", features = [
+    "winbase", "fileapi", "handleapi", "winerror", "winioctl",
+    "ioapiset", "minwindef", "winnt", "errhandlingapi",
+    "basetsd", "sysinfoapi",
+]}
+clap = { version = "4", features = ["derive"] }
+ssh2 = "0.9"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

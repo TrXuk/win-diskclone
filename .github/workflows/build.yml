@@ -1,0 +1,24 @@
+# Build diskclone and diskclone-visual for Windows (x86_64-pc-windows-gnu)
+# Runs only on push to main branch. No inputs, no PR triggers, no tag triggers.
+name: Build Windows binaries
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build diskclone
+        run: ./build-docker.sh
+
+      - name: Upload diskclone binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: diskclone-windows
+          path: target/x86_64-pc-windows-gnu/release/
