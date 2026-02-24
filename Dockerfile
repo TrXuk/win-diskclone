@@ -8,8 +8,9 @@
 
 FROM rust:1.86-bookworm
 
-# Install MinGW cross-compiler, git (for versioning), and build deps for libssh2
+# Install MinGW cross-compiler (incl. windres for icon embedding), git, and build deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    binutils-mingw-w64-x86-64 \
     g++-mingw-w64-x86-64 \
     gcc-mingw-w64-x86-64 \
     cmake \

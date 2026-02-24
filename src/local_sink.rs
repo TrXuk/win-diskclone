@@ -16,10 +16,11 @@ use widestring::U16CString;
 use crate::error::Result;
 
 /// Wraps an ImageSink to report progress via shared atomic counters.
-/// Use `bytes_written` (Arc<AtomicU64>) and `total_bytes` for progress display.
+/// Use `bytes_written` (Arc<AtomicU64>) for progress display.
 pub struct ProgressSink<S: ImageSink> {
     inner: S,
     bytes_written: std::sync::Arc<AtomicU64>,
+    #[allow(dead_code)]
     total_bytes: u64,
 }
 

@@ -168,7 +168,7 @@ impl DiskCloneApp {
                 },
             );
             match result {
-                Ok(bytes) => {
+                Ok(_bytes) => {
                     let _ = tx.send(WorkerMsg::Done);
                 }
                 Err(e) => {
