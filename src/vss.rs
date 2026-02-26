@@ -103,12 +103,15 @@ impl VssSnapshot {
     }
 
     /// Gets the shadow copy device path for a volume by its original volume name.
+    /// Volume names can differ in prefix (\\.\ vs \\?\) between FindFirstVolume and VSS;
+    /// we normalize by comparing the Volume{guid} part only.
     pub fn get_shadow_path(&self, volume_name: &str) -> Option<String> {
         let backup_comp = self.backup_components.as_ref()?;
+        let volume_key = normalize_volume_name_for_match(volume_name);
         for &snapshot_id in &self.snapshot_ids {
             if let Ok(props) = backup_comp.get_snapshot_properties(snapshot_id) {
                 let orig = props.original_volume_name().to_string_lossy();
-                if orig.trim_matches(|c| c == '\\' || c == '/') == volume_name.trim_matches(|c| c == '\\' || c == '/') {
+                if normalize_volume_name_for_match(&orig) == volume_key {
                     let s = props.snapshot_device_object();
                     return Some(s.to_string_lossy().trim_end_matches('\\').to_string());
                 }
@@ -154,6 +157,18 @@ impl Drop for VssSnapshot {
         if let Some(backup_comp) = self.backup_components.take() {
             let _ = backup_comp.backup_complete();
         }
+    }
+}
+
+/// Normalizes a volume name for comparison. FindFirstVolume returns \\?\Volume{guid}\
+/// while VSS GetSnapshotProperties may return \\.\Volume{guid}\ - we compare by
+/// the Volume{guid} part only (case-insensitive).
+fn normalize_volume_name_for_match(name: &str) -> String {
+    let s = name.trim_matches(|c| c == '\\' || c == '/');
+    if let Some(idx) = s.to_uppercase().find("VOLUME{") {
+        s[idx..].to_uppercase()
+    } else {
+        s.to_uppercase()
     }
 }
 

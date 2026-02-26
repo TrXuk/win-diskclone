@@ -8,7 +8,8 @@ use std::time::Instant;
 use clap::Parser;
 
 use diskclone::{
-    DiskCloneError, FileSink, ImageBuilder, LocalDiskSink, SshSink, VssSnapshot,
+    format_diagram_ascii, DiskCloneError, FileSink, ImageBuilder, LocalDiskSink, SshSink,
+    VssSnapshot,
 };
 
 #[derive(Parser, Debug)]
@@ -69,6 +70,14 @@ fn main() -> Result<(), DiskCloneError> {
     let builder = ImageBuilder::new(args.disk, &vss, args.buffer_size)?;
     let total_size = builder.disk_length();
     eprintln!("Disk size: {} GB", total_size / (1024 * 1024 * 1024));
+
+    let regions = builder.diagram_regions();
+    eprintln!("\n{}", format_diagram_ascii(&regions, total_size));
+    eprintln!("\nPress Enter to start clone, or Ctrl+C to cancel...");
+    {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+    }
 
     let stream_start = Instant::now();
     let mut bytes_written = 0u64;

@@ -10,15 +10,17 @@ use std::time::Instant;
 
 use eframe::egui;
 use diskclone::{
-    create_ssh_session, DiskCloneError, FileSink, ImageBuilder, LocalDiskSink, ProgressSink,
-    SshSink, VssSnapshot,
+    create_ssh_session, DiagramRegion, DiskCloneError, FileSink, ImageBuilder, LocalDiskSink,
+    ProgressSink, RegionSource, SshSink, VssSnapshot,
 };
 
 enum WorkerMsg {
     Total(u64),
     Status(String, bool),
+    DiagramReady(Vec<DiagramRegion>, u64),
     Done,
     Error(String),
+    Cancelled,
 }
 
 fn main() -> eframe::Result<()> {
@@ -55,6 +57,8 @@ impl Default for DiskCloneApp {
             phase: Phase::default(),
             error: None,
             worker_rx: None,
+            diagram_regions: Vec::new(),
+            confirm_tx: None,
         }
     }
 }
@@ -76,6 +80,8 @@ struct DiskCloneApp {
     phase: Phase,
     error: Option<String>,
     worker_rx: Option<mpsc::Receiver<WorkerMsg>>,
+    diagram_regions: Vec<DiagramRegion>,
+    confirm_tx: Option<mpsc::Sender<()>>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -92,6 +98,7 @@ enum Phase {
     Idle,
     LoadingDisks,
     CreatingSnapshot,
+    Confirm,
     Streaming,
     Done,
     Error,
@@ -146,6 +153,7 @@ impl DiskCloneApp {
         let target_disk = self.target_disk;
 
         let (tx, rx) = mpsc::channel();
+        let (confirm_tx, confirm_rx) = mpsc::channel();
 
         thread::spawn(move || {
             let ssh_password = if ssh_password.trim().is_empty() {
@@ -163,6 +171,7 @@ impl DiskCloneApp {
                 &local_file_path,
                 target_disk,
                 progress,
+                confirm_rx,
                 |msg| {
                     let _ = tx.send(msg);
                 },
@@ -178,7 +187,8 @@ impl DiskCloneApp {
         });
 
         self.worker_rx = Some(rx);
-        self.phase = Phase::Streaming;
+        self.confirm_tx = Some(confirm_tx);
+        self.phase = Phase::CreatingSnapshot;
     }
 }
 
@@ -192,6 +202,7 @@ fn run_clone<F: Fn(WorkerMsg)>(
     local_file_path: &str,
     target_disk: Option<u32>,
     progress: Arc<AtomicU64>,
+    confirm_rx: mpsc::Receiver<()>,
     send: F,
 ) -> Result<u64, DiskCloneError> {
     send(WorkerMsg::Status("Creating VSS snapshot...".to_string(), true));
@@ -202,7 +213,15 @@ fn run_clone<F: Fn(WorkerMsg)>(
 
     let builder = ImageBuilder::new(source_disk, &vss, 16)?;
     let total_size = builder.disk_length();
-    send(WorkerMsg::Total(total_size));
+    let regions = builder.diagram_regions();
+    send(WorkerMsg::DiagramReady(regions, total_size));
+
+    // Wait for user confirmation before starting
+    if confirm_rx.recv().is_err() {
+        send(WorkerMsg::Cancelled);
+        return Ok(0);
+    }
+
     progress.store(0, Ordering::Relaxed);
 
     let stream_start = Instant::now();
@@ -263,7 +282,10 @@ fn run_clone<F: Fn(WorkerMsg)>(
 
 impl eframe::App for DiskCloneApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.phase == Phase::Streaming || self.phase == Phase::CreatingSnapshot {
+        if self.phase == Phase::Streaming
+            || self.phase == Phase::CreatingSnapshot
+            || self.phase == Phase::Confirm
+        {
             ctx.request_repaint();
         }
 
@@ -275,6 +297,12 @@ impl eframe::App for DiskCloneApp {
                         self.status = s;
                         self.status_ok = ok;
                     }
+                    Ok(WorkerMsg::DiagramReady(regions, total)) => {
+                        self.diagram_regions = regions;
+                        self.total_bytes = total;
+                        self.phase = Phase::Confirm;
+                        self.status = "Review layout and confirm to start".to_string();
+                    }
                     Ok(WorkerMsg::Done) => {
                         self.phase = Phase::Done;
                         break;
@@ -283,6 +311,13 @@ impl eframe::App for DiskCloneApp {
                         self.status = e.clone();
                         self.error = Some(e);
                         self.phase = Phase::Error;
+                        break;
+                    }
+                    Ok(WorkerMsg::Cancelled) => {
+                        self.phase = Phase::Idle;
+                        self.status = "Cancelled".to_string();
+                        self.diagram_regions.clear();
+                        self.confirm_tx = None;
                         break;
                     }
                     Err(_) => {
@@ -391,6 +426,91 @@ impl eframe::App for DiskCloneApp {
                         if ui.button("Start clone").clicked() {
                             self.start_clone();
                         }
+                    }
+                    Phase::Confirm => {
+                        ui.label("Disk layout — data sources:");
+                        ui.add_space(4.0);
+
+                        let disk_len = self.total_bytes as f64;
+                        let bar_height = 24.0;
+
+                        // Visual bar
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), bar_height),
+                            egui::Sense::hover(),
+                        );
+                        let mut x = rect.left();
+                        for r in &self.diagram_regions {
+                            let pct = (r.end - r.start) as f64 / disk_len;
+                            let w = (rect.width() * pct as f32).max(2.0);
+                            let color = match &r.source {
+                                RegionSource::GptPrimary => egui::Color32::from_rgb(80, 120, 180),
+                                RegionSource::GptBackup => egui::Color32::from_rgb(60, 100, 160),
+                                RegionSource::Gap => egui::Color32::from_rgb(100, 100, 100),
+                                RegionSource::PartitionShadow { .. } => {
+                                    egui::Color32::from_rgb(60, 160, 80)
+                                }
+                                RegionSource::PartitionRaw { .. } => {
+                                    egui::Color32::from_rgb(180, 120, 60)
+                                }
+                            };
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, bar_height)),
+                                2.0,
+                                color,
+                            );
+                            x += w;
+                        }
+
+                        ui.add_space(8.0);
+
+                        // Legend with color swatches matching the bar
+                        let swatch_size = egui::vec2(16.0, 16.0);
+                        let legend_items: [(egui::Color32, &str); 5] = [
+                            (egui::Color32::from_rgb(80, 120, 180), "Primary GPT (raw disk)"),
+                            (egui::Color32::from_rgb(60, 100, 160), "Backup GPT (raw disk)"),
+                            (egui::Color32::from_rgb(100, 100, 100), "Gap (zeros)"),
+                            (egui::Color32::from_rgb(60, 160, 80), "Partition from VSS shadow"),
+                            (egui::Color32::from_rgb(180, 120, 60), "Partition from raw disk (MSR, etc.)"),
+                        ];
+                        for (color, label) in legend_items {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(swatch_size, egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 2.0, color);
+                                ui.add_space(6.0);
+                                ui.label(label);
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+
+                        for r in &self.diagram_regions {
+                            let size_mb = (r.end - r.start) as f64 / 1024.0 / 1024.0;
+                            ui.label(format!("  {} ({:.1} MB)", r.label, size_mb));
+                        }
+
+                        ui.add_space(12.0);
+                        ui.label(format!(
+                            "Total: {:.1} GB",
+                            self.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+                        ));
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm and start clone").clicked() {
+                                if let Some(tx) = self.confirm_tx.take() {
+                                    let _ = tx.send(());
+                                    self.phase = Phase::Streaming;
+                                    self.status = "Streaming...".to_string();
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                drop(self.confirm_tx.take());
+                                self.phase = Phase::Idle;
+                                self.diagram_regions.clear();
+                            }
+                        });
                     }
                     Phase::CreatingSnapshot | Phase::Streaming => {
                         ui.spinner();

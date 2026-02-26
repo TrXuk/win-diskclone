@@ -9,6 +9,7 @@ pub const VERSION: &str = env!("DISKCLONE_VERSION");
 /// Short git commit hash at build time.
 pub const GIT_HASH: &str = env!("DISKCLONE_GIT_HASH");
 
+pub mod diagram;
 pub mod disk;
 pub mod error;
 pub mod image_builder;
@@ -21,6 +22,7 @@ pub use disk::{
     DiskLayout, PartitionInfo, PhysicalDiskInfo, SECTOR_SIZE,
 };
 pub use error::{DiskCloneError, Result};
+pub use diagram::{build_diagram_regions, format_diagram_ascii, DiagramRegion, RegionSource};
 pub use image_builder::ImageBuilder;
 pub use local_sink::{FileSink, LocalDiskSink, ProgressSink};
 pub use ssh_sink::{create_ssh_session, SshSink};
