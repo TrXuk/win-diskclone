@@ -13,6 +13,8 @@ pub struct DiagramRegion {
     pub end: u64,
     pub label: String,
     pub source: RegionSource,
+    /// Shadow copy device path for browse (PartitionShadow only).
+    pub shadow_path: Option<String>,
 }
 
 /// Where the data for a region comes from.
@@ -47,6 +49,7 @@ pub fn build_diagram_regions(
         end: gpt_size,
         label: "Primary GPT (MBR + header + partition table)".to_string(),
         source: RegionSource::GptPrimary,
+        shadow_path: None,
     });
     let mut pos = gpt_size;
 
@@ -71,6 +74,7 @@ pub fn build_diagram_regions(
                     end: gap_end,
                     label: format!("Gap ({:.1} MB)", (gap_end - pos) as f64 / 1024.0 / 1024.0),
                     source: RegionSource::Gap,
+                    shadow_path: None,
                 });
                 pos = gap_end;
             }
@@ -78,8 +82,16 @@ pub fn build_diagram_regions(
 
         // Partition
         if part_start < backup_start {
-            let has_shadow = shadow_map.contains_key(&part.starting_offset)
-                || shadow_map.keys().any(|&off| off >= part_start && off < part_end);
+            let shadow_path = shadow_map
+                .get(&part.starting_offset)
+                .or_else(|| {
+                    shadow_map
+                        .keys()
+                        .find(|&&off| off >= part_start && off < part_end)
+                        .and_then(|off| shadow_map.get(off))
+                })
+                .cloned();
+            let has_shadow = shadow_path.is_some();
             let source = if has_shadow {
                 RegionSource::PartitionShadow {
                     partition_num: part.partition_number,
@@ -99,6 +111,7 @@ pub fn build_diagram_regions(
                     part.partition_number, size_mb, src_str
                 ),
                 source,
+                shadow_path,
             });
             pos = part_end;
         }
@@ -114,6 +127,7 @@ pub fn build_diagram_regions(
                 (backup_start - pos) as f64 / 1024.0 / 1024.0
             ),
             source: RegionSource::Gap,
+            shadow_path: None,
         });
     }
 
@@ -124,6 +138,7 @@ pub fn build_diagram_regions(
             end: disk_length,
             label: "Backup GPT (partition table copy)".to_string(),
             source: RegionSource::GptBackup,
+            shadow_path: None,
         });
     }
 

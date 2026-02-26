@@ -26,4 +26,4 @@ pub use diagram::{build_diagram_regions, format_diagram_ascii, DiagramRegion, Re
 pub use image_builder::ImageBuilder;
 pub use local_sink::{FileSink, LocalDiskSink, ProgressSink};
 pub use ssh_sink::{create_ssh_session, SshSink};
-pub use vss::VssSnapshot;
+pub use vss::{analyze_snapshot_support, open_shadow_in_explorer, SnapshotAnalysis, VssSnapshot};
