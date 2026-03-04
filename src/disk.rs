@@ -8,7 +8,7 @@ use winapi::shared::minwindef::DWORD;
 use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING, SetFilePointerEx};
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::ioapiset::DeviceIoControl;
-use winapi::um::winbase::{FILE_FLAG_NO_BUFFERING, FILE_BEGIN};
+use winapi::um::winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING, FILE_BEGIN};
 use winapi::um::winioctl::{
     GET_LENGTH_INFORMATION, DRIVE_LAYOUT_INFORMATION_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
     IOCTL_DISK_GET_LENGTH_INFO, PARTITION_INFORMATION_EX,
@@ -266,10 +266,19 @@ pub fn read_sectors(handle: HANDLE, offset: u64, buffer: &mut [u8]) -> Result<us
 
 /// Opens a volume or shadow copy for raw read access.
 /// Path should be like `\\.\GLOBALROOT\Device\HarddiskVolumeShadowCopy12` or `\\.\C:`.
+/// Uses FILE_FLAG_BACKUP_SEMANTICS for shadow copies (required for VSS device access).
 pub fn open_volume_raw(path: &str) -> Result<HANDLE> {
     let path_win = path.replace('/', "\\");
     let path_wide = U16CString::from_str(&path_win)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    // Shadow copy devices need FILE_FLAG_BACKUP_SEMANTICS for CreateFile to succeed
+    let is_shadow = path_win.contains("ShadowCopy") || path_win.contains("shadowcopy");
+    let flags = if is_shadow {
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_BACKUP_SEMANTICS
+    } else {
+        FILE_FLAG_NO_BUFFERING
+    };
 
     let handle = unsafe {
         CreateFileW(
@@ -278,7 +287,7 @@ pub fn open_volume_raw(path: &str) -> Result<HANDLE> {
             FILE_SHARE_READ,
             ptr::null_mut(),
             OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING,
+            flags,
             ptr::null_mut(),
         )
     };

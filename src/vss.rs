@@ -1,4 +1,8 @@
 //! Volume Shadow Copy Service integration for creating consistent disk snapshots.
+//!
+//! Uses correct Windows API usage per MSDN:
+//! - CreateFile for volumes: FILE_FLAG_BACKUP_SEMANTICS, no trailing backslash
+//! - Volume enumeration: FindFirstVolumeW / FindNextVolumeW only
 
 use std::collections::HashMap;
 use std::ptr;
@@ -10,14 +14,20 @@ use widestring::U16CString;
 
 use winapi::ctypes::c_void;
 use winapi::shared::minwindef::DWORD;
-use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+use winapi::um::fileapi::{
+    CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose,
+    GetVolumePathNamesForVolumeNameW, OPEN_EXISTING,
+};
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::ioapiset::DeviceIoControl;
+use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
 use winapi::um::winioctl::IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS;
-use winapi::um::winnt::{FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GENERIC_READ};
+use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
 
 use crate::disk::PartitionInfo;
 use crate::error::{DiskCloneError, Result};
+
+const MAX_PATH: usize = 260;
 
 /// Result of analyzing a partition for VSS snapshot support.
 #[derive(Debug, Clone)]
@@ -27,6 +37,8 @@ pub struct SnapshotAnalysis {
     pub size_mb: f64,
     pub has_volume: bool,
     pub volume_display: String,
+    /// Drive letters (e.g. ["C:"]) for mounted volumes, empty if not mounted.
+    pub drive_letters: Vec<String>,
     pub vss_supported: bool,
     pub reason: String,
 }
@@ -38,12 +50,13 @@ pub fn analyze_snapshot_support(disk_number: u32) -> Result<Vec<SnapshotAnalysis
     let layout = crate::disk::get_disk_layout_from_disk(disk_number)?;
     let volumes_on_disk = get_volumes_on_disk(disk_number)?;
 
-    // Build volume offset -> (name, display) map
-    let mut volume_info: HashMap<u64, (String, String)> = HashMap::new();
+    // Build volume offset -> (name, display, drive_letters) map
+    let mut volume_info: HashMap<u64, (String, String, Vec<String>)> = HashMap::new();
     for vol in &volumes_on_disk {
         if let Some((_, offset)) = get_volume_disk_extents(vol)? {
             let display = volume_display_name(vol);
-            volume_info.insert(offset, (vol.clone(), display));
+            let drive_letters = get_volume_drive_letters(vol).unwrap_or_default();
+            volume_info.insert(offset, (vol.clone(), display, drive_letters));
         }
     }
 
@@ -120,7 +133,7 @@ pub fn analyze_snapshot_support(disk_number: u32) -> Result<Vec<SnapshotAnalysis
                     .and_then(|off| volume_info.get(off))
             });
 
-        if let Some((_name, display)) = vol_match {
+        if let Some((_name, display, drive_letters)) = vol_match {
             let offset = part.starting_offset;
             let (supported, reason) = vss_supported
                 .get(&offset)
@@ -139,6 +152,7 @@ pub fn analyze_snapshot_support(disk_number: u32) -> Result<Vec<SnapshotAnalysis
                 size_mb,
                 has_volume: true,
                 volume_display: display.clone(),
+                drive_letters: drive_letters.to_vec(),
                 vss_supported: supported,
                 reason,
             });
@@ -149,13 +163,81 @@ pub fn analyze_snapshot_support(disk_number: u32) -> Result<Vec<SnapshotAnalysis
                 size_mb,
                 has_volume: false,
                 volume_display: String::new(),
+                drive_letters: Vec::new(),
                 vss_supported: false,
-                reason: "No volume (e.g. MSR) — will use raw disk".to_string(),
+                reason: "No volume (e.g. MSR) - will use raw disk".to_string(),
             });
         }
     }
 
     Ok(results)
+}
+
+/// Gets drive letters (e.g. ["C:"]) for a volume. Volume name must be \\?\Volume{guid}\
+fn get_volume_drive_letters(volume_name: &str) -> Result<Vec<String>> {
+    let vol_path = if volume_name.ends_with('\\') {
+        volume_name.to_string()
+    } else {
+        format!("{}\\", volume_name)
+    };
+    let vol_wide = U16CString::from_str(&vol_path)
+        .map_err(|e| DiskCloneError::Other(e.to_string()))?;
+    let mut buf = vec![0u16; 256];
+    let mut len: DWORD = 0;
+
+    let ok = unsafe {
+        GetVolumePathNamesForVolumeNameW(
+            vol_wide.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as DWORD,
+            &mut len,
+        )
+    };
+
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(122) {
+            // ERROR_INSUFFICIENT_BUFFER - retry with larger buffer
+            buf.resize(len as usize, 0);
+            let ok2 = unsafe {
+                GetVolumePathNamesForVolumeNameW(
+                    vol_wide.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len() as DWORD,
+                    &mut len,
+                )
+            };
+            if ok2 == 0 {
+                return Err(err.into());
+            }
+        } else {
+            return Err(err.into());
+        }
+    }
+
+    // Parse null-separated strings: "C:\"<nul>"D:\"<nul><nul>
+    let mut letters = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0 {
+            break;
+        }
+        let start = i;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1;
+        }
+        let s = String::from_utf16_lossy(&buf[start..i]);
+        let s = s.trim_matches(|c| c == '\\' || c == '/');
+        if !s.is_empty() {
+            if s.len() == 1 {
+                letters.push(format!("{}:", s));
+            } else {
+                letters.push(s.to_string());
+            }
+        }
+        i += 1; // skip null
+    }
+    Ok(letters)
 }
 
 fn volume_display_name(volume_name: &str) -> String {
@@ -359,7 +441,7 @@ pub fn open_shadow_in_explorer(path: &str) -> Result<()> {
         format!(r"\\.\GLOBALROOT\Device\{}", path.trim_start_matches('\\'))
     };
 
-    // Ensure path has trailing backslash for volume root access
+    // Ensure path has trailing backslash for volume root access (GetFinalPathNameByHandle)
     let open_path = if device_path.ends_with('\\') {
         device_path.clone()
     } else {
@@ -385,8 +467,8 @@ pub fn open_shadow_in_explorer(path: &str) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
 
-    // Get volume GUID path (\\?\Volume{guid}\)
-    let mut vol_path = [0u16; 52];
+    // Get volume GUID path (\\?\Volume{guid}\) - use larger buffer for full GUID
+    let mut vol_path = [0u16; MAX_PATH + 1];
     let len = unsafe {
         GetFinalPathNameByHandleW(
             handle,
@@ -454,149 +536,146 @@ fn wait_vss_async<E: From<i32> + std::fmt::Debug>(async_result: VssAsync<E>) -> 
     Ok(())
 }
 
-/// Runs `vssadmin list volumes` and parses output for volume names in \\?\Volume{GUID}\ format.
-/// These are the canonical names VSS uses for shadow-copy-eligible volumes.
-fn get_vssadmin_volumes() -> Result<Vec<String>> {
-    use std::process::Command;
-
-    let output = Command::new("vssadmin")
-        .args(["list", "volumes"])
-        .output()
-        .map_err(|e| DiskCloneError::Other(format!("vssadmin list volumes failed: {}", e)))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+/// Enumerates all volumes via FindFirstVolumeW/FindNextVolumeW.
+/// Returns \\?\Volume{GUID}\ paths (with trailing backslash for VSS APIs).
+fn enumerate_all_volumes() -> Result<Vec<String>> {
     let mut volumes = Vec::new();
+    let mut volume_name = [0u16; MAX_PATH + 1];
 
-    // Parse lines containing \\?\Volume{guid} or \\.\Volume{guid} - vssadmin outputs "Volume Path: \\?\Volume{...}\"
-    for line in stdout.lines() {
-        let vol = line
-            .find(r"\\?\Volume{")
-            .or_else(|| line.find(r"\\.\Volume{"))
-            .and_then(|idx| {
-                let rest = &line[idx..];
-                rest.find('}').map(|end| {
-                    let guid_part = &rest[..=end];
-                    let normalized = if guid_part.starts_with(r"\\.\") {
-                        format!(r"\\?\{}\", &guid_part[4..]) // \\.\Volume{guid} -> \\?\Volume{guid}\
-                    } else {
-                        format!("{}\\", guid_part.trim_end_matches('\\'))
-                    };
-                    normalized
-                })
-            });
-        if let Some(v) = vol {
-            if !volumes.contains(&v) {
-                volumes.push(v);
-            }
+    let find_handle = unsafe { FindFirstVolumeW(volume_name.as_mut_ptr(), volume_name.len() as DWORD) };
+
+    if find_handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    loop {
+        let len = volume_name.iter().position(|&c| c == 0).unwrap_or(volume_name.len());
+        let name = String::from_utf16_lossy(&volume_name[..len]);
+        // Ensure trailing backslash for VSS API consistency
+        let normalized = if name.ends_with('\\') {
+            name
+        } else {
+            format!("{}\\", name)
+        };
+        volumes.push(normalized);
+
+        if unsafe {
+            FindNextVolumeW(find_handle, volume_name.as_mut_ptr(), volume_name.len() as DWORD)
+        } == 0
+        {
+            break;
         }
+    }
+
+    unsafe {
+        FindVolumeClose(find_handle);
     }
 
     Ok(volumes)
 }
 
 /// Gets volume names (GUID paths) for all volumes on the specified physical disk.
-/// Uses vssadmin list volumes to get canonical \\?\Volume{GUID}\ names (VSS-eligible volumes),
-/// then filters by disk via get_volume_disk_extents. Falls back to FindFirstVolumeW if vssadmin fails.
+/// Uses FindFirstVolumeW/FindNextVolumeW only; filters by disk via get_volume_disk_extents.
 fn get_volumes_on_disk(disk_number: u32) -> Result<Vec<String>> {
-    use winapi::um::fileapi::{FindFirstVolumeW, FindNextVolumeW, FindVolumeClose};
-
+    let all = enumerate_all_volumes()?;
     let mut volumes_on_disk = Vec::new();
 
-    // Primary: use vssadmin list volumes for canonical volume names
-    if let Ok(vss_volumes) = get_vssadmin_volumes() {
-        for vol in vss_volumes {
-            if let Ok(Some((disk, _))) = get_volume_disk_extents(&vol) {
-                if disk == disk_number {
-                    volumes_on_disk.push(vol);
-                }
+    for vol in all {
+        if let Ok(Some((disk, _))) = get_volume_disk_extents(&vol) {
+            if disk == disk_number {
+                volumes_on_disk.push(vol);
             }
-        }
-    }
-
-    // Fallback: FindFirstVolumeW if vssadmin failed or returned nothing
-    if volumes_on_disk.is_empty() {
-        const MAX_PATH: usize = 260;
-        let mut volume_name = [0u16; MAX_PATH + 1];
-
-        let find_handle = unsafe { FindFirstVolumeW(volume_name.as_mut_ptr(), volume_name.len() as DWORD) };
-
-        if find_handle != INVALID_HANDLE_VALUE {
-            loop {
-                let len = volume_name.iter().position(|&c| c == 0).unwrap_or(volume_name.len());
-                let name = String::from_utf16_lossy(&volume_name[..len]);
-                let name_str = name.trim_end_matches('\\');
-
-                if let Ok(Some((disk, _))) = get_volume_disk_extents(name_str) {
-                    if disk == disk_number {
-                        volumes_on_disk.push(format!("{}\\", name_str));
-                    }
-                }
-
-                if unsafe {
-                    FindNextVolumeW(find_handle, volume_name.as_mut_ptr(), volume_name.len() as DWORD)
-                } == 0
-                {
-                    break;
-                }
-            }
-            unsafe { FindVolumeClose(find_handle) };
         }
     }
 
     Ok(volumes_on_disk)
 }
 
-/// Gets the disk number and starting offset for a volume.
-fn get_volume_disk_offset(volume_name: &str) -> Result<Option<u64>> {
-    let (_disk_num, offset) = get_volume_disk_extents(volume_name)?.unwrap_or((0, 0));
-    Ok(Some(offset))
-}
+/// Diagnostic: prints VSS/volume enumeration details to stderr. Run on Windows to debug
+/// "no volumes" or "raw disk" issues. Usage: diskclone --debug-vss --disk N
+pub fn debug_vss_diag(disk_number: u32) -> Result<String> {
+    use std::fmt::Write;
+    use winapi::um::errhandlingapi::GetLastError;
 
-fn get_volume_disk_extents(volume_name: &str) -> Result<Option<(u32, u64)>> {
-    use winapi::um::winioctl::{DISK_EXTENT, VOLUME_DISK_EXTENTS};
+    let mut out = String::new();
 
-    let vol = volume_name.trim().trim_matches('\\');
-    let base = if vol.starts_with(r"\\?\") || vol.starts_with(r"\\.\") {
-        vol[4..].trim_matches('\\').to_string()
-    } else {
-        vol.to_string()
+    writeln!(out, "=== VSS Diagnostic for Disk {} ===", disk_number).ok();
+
+    // 1. Disk layout
+    let layout = match crate::disk::get_disk_layout_from_disk(disk_number) {
+        Ok(l) => l,
+        Err(e) => {
+            writeln!(out, "get_disk_layout_from_disk FAILED: {:?}", e).ok();
+            return Ok(out);
+        }
     };
+    writeln!(out, "Disk length: {} bytes", layout.disk_length).ok();
+    for p in &layout.partitions {
+        if p.is_used && p.partition_length > 0 {
+            writeln!(
+                out,
+                "  Partition {}: offset={} length={}",
+                p.partition_number, p.starting_offset, p.partition_length
+            )
+            .ok();
+        }
+    }
 
-    // Volume GUID paths require trailing backslash for CreateFile.
-    // Try \\?\ prefix first (vssadmin format), then \\.\
-    let paths_to_try: Vec<String> = if base.starts_with("Volume{") {
-        let with_slash = format!("{}\\", base);
-        vec![
-            format!(r"\\?\{}", with_slash),  // vssadmin format
-            format!(r"\\.\{}", with_slash),
-        ]
-    } else {
-        vec![format!(r"\\.\{}", base)]
+    // 2. Enumerate volumes
+    let volumes = match enumerate_all_volumes() {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(out, "enumerate_all_volumes FAILED: {:?}", e).ok();
+            return Ok(out);
+        }
     };
+    writeln!(out, "Enumerated {} volumes", volumes.len()).ok();
 
-    for path in &paths_to_try {
-        let path_wide = widestring::U16CString::from_str(path)
-            .map_err(|e| DiskCloneError::Other(e.to_string()))?;
+    // 3. For each volume, try get_volume_disk_extents with detailed error
+    for (i, vol) in volumes.iter().enumerate() {
+        writeln!(out, "\nVolume {}: {}", i + 1, vol).ok();
+
+        let vol_trim = vol.trim();
+        let base = if vol_trim.starts_with(r"\\?\") || vol_trim.starts_with(r"\\.\") {
+            vol_trim[4..].trim_end_matches('\\').to_string()
+        } else {
+            vol_trim.trim_start_matches('\\').trim_end_matches('\\').to_string()
+        };
+        let path = if base.starts_with("Volume{") {
+            format!(r"\\?\{}", base)
+        } else {
+            format!(r"\\.\{}", base)
+        };
+        writeln!(out, "  CreateFile path: {}", path).ok();
+
+        let path_wide = match widestring::U16CString::from_str(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                writeln!(out, "  U16CString FAILED: {}", e).ok();
+                continue;
+            }
+        };
 
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
                 GENERIC_READ,
-                FILE_SHARE_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null_mut(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_FLAG_BACKUP_SEMANTICS,
                 ptr::null_mut(),
             )
         };
 
         if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { GetLastError() };
+            writeln!(out, "  CreateFile FAILED, GetLastError={} (0x{:x})", err, err).ok();
             continue;
         }
 
-        let mut buffer = vec![0u8; std::mem::size_of::<VOLUME_DISK_EXTENTS>() + 64];
+        let mut buffer = vec![0u8; 256];
         let mut bytes_returned: DWORD = 0;
-
         let ok = unsafe {
             DeviceIoControl(
                 handle,
@@ -609,17 +688,108 @@ fn get_volume_disk_extents(volume_name: &str) -> Result<Option<(u32, u64)>> {
                 ptr::null_mut(),
             )
         };
-
         unsafe { winapi::um::handleapi::CloseHandle(handle) };
 
-        if ok != 0 {
-            let extents = unsafe { &*(buffer.as_ptr() as *const VOLUME_DISK_EXTENTS) };
-            if extents.NumberOfDiskExtents > 0 {
-                let extent = unsafe { &*(&extents.Extents as *const _ as *const DISK_EXTENT) };
-                return Ok(Some((extent.DiskNumber, unsafe { *extent.StartingOffset.QuadPart() } as u64)));
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            writeln!(out, "  DeviceIoControl FAILED, GetLastError={} (0x{:x})", err, err).ok();
+            continue;
+        }
+
+        let extents = unsafe { &*(buffer.as_ptr() as *const winapi::um::winioctl::VOLUME_DISK_EXTENTS) };
+        if extents.NumberOfDiskExtents > 0 {
+            let extent = unsafe {
+                &*(&extents.Extents as *const _ as *const winapi::um::winioctl::DISK_EXTENT)
+            };
+            let disk = extent.DiskNumber;
+            let offset = unsafe { *extent.StartingOffset.QuadPart() } as u64;
+            writeln!(out, "  OK: disk={} offset={}", disk, offset).ok();
+            if disk == disk_number {
+                writeln!(out, "  -> ON TARGET DISK").ok();
             }
+        } else {
+            writeln!(out, "  No extents").ok();
         }
     }
 
-    Ok(None)
+    // 4. Summary: volumes on our disk
+    let on_disk = get_volumes_on_disk(disk_number)?;
+    writeln!(out, "\nVolumes on disk {}: {}", disk_number, on_disk.len()).ok();
+    for v in &on_disk {
+        writeln!(out, "  {}", v).ok();
+    }
+
+    Ok(out)
+}
+
+/// Gets the disk number and starting offset for a volume.
+/// Uses correct CreateFile flags per MSDN: FILE_FLAG_BACKUP_SEMANTICS (required for volumes),
+/// FILE_SHARE_READ|WRITE|DELETE, and path WITHOUT trailing backslash (opens volume object).
+fn get_volume_disk_extents(volume_name: &str) -> Result<Option<(u32, u64)>> {
+    use winapi::um::winioctl::{DISK_EXTENT, VOLUME_DISK_EXTENTS};
+
+    // Extract Volume{guid} from \\?\Volume{guid}\ or \\.\Volume{guid}\
+    // Do NOT use trim_matches('\\') - it strips leading \\ and corrupts the string.
+    let vol = volume_name.trim();
+    let base = if vol.starts_with(r"\\?\") || vol.starts_with(r"\\.\") {
+        vol[4..].trim_end_matches('\\').to_string()
+    } else {
+        vol.trim_start_matches('\\').trim_end_matches('\\').to_string()
+    };
+
+    // For CreateFile + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: path WITHOUT trailing backslash
+    let path = if base.starts_with("Volume{") {
+        format!(r"\\?\{}", base)
+    } else {
+        format!(r"\\.\{}", base)
+    };
+
+    let path_wide = widestring::U16CString::from_str(&path)
+        .map_err(|e| DiskCloneError::Other(e.to_string()))?;
+
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return Ok(None);
+    }
+
+    let mut buffer = vec![0u8; std::mem::size_of::<VOLUME_DISK_EXTENTS>() + 64];
+    let mut bytes_returned: DWORD = 0;
+
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            ptr::null_mut(),
+            0,
+            buffer.as_mut_ptr() as *mut c_void,
+            buffer.len() as DWORD,
+            &mut bytes_returned,
+            ptr::null_mut(),
+        )
+    };
+
+    unsafe { winapi::um::handleapi::CloseHandle(handle) };
+
+    if ok == 0 {
+        return Ok(None);
+    }
+
+    let extents = unsafe { &*(buffer.as_ptr() as *const VOLUME_DISK_EXTENTS) };
+    if extents.NumberOfDiskExtents > 0 {
+        let extent = unsafe { &*(&extents.Extents as *const _ as *const DISK_EXTENT) };
+        Ok(Some((extent.DiskNumber, unsafe { *extent.StartingOffset.QuadPart() } as u64)))
+    } else {
+        Ok(None)
+    }
 }

@@ -1,14 +1,14 @@
 //! Local output sinks for disk image.
 
-use std::io::Write;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use winapi::ctypes::c_void;
 use winapi::shared::minwindef::DWORD;
-use winapi::um::fileapi::{CreateFileW, WriteFile};
+use winapi::um::fileapi::{CreateFileW, FlushFileBuffers, WriteFile, OPEN_EXISTING};
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-use winapi::um::fileapi::OPEN_EXISTING;
+// CREATE_ALWAYS = 2 (create new or overwrite existing)
+const CREATE_ALWAYS: DWORD = 2;
 use winapi::um::winnt::{FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, GENERIC_WRITE};
 
 use widestring::U16CString;
@@ -56,25 +56,78 @@ pub trait ImageSink: Send {
 }
 
 /// Writes disk image to a local file.
+/// Uses raw Windows CreateFile/WriteFile to avoid std::fs buffering issues.
 pub struct FileSink {
-    file: std::fs::File,
+    handle: winapi::um::winnt::HANDLE,
 }
+
+// SAFETY: FileSink is used from a single thread during streaming
+unsafe impl Send for FileSink {}
 
 impl FileSink {
     pub fn new(path: &str) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
-        Ok(Self { file })
+        let path_win = path.replace('/', "\\");
+        let path_wide = U16CString::from_str(&path_win)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                ptr::null_mut(),
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        Ok(Self { handle })
     }
 }
 
 impl ImageSink for FileSink {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
-        Ok(self.file.write(data)?)
+        let mut bytes_written: DWORD = 0;
+        let ok = unsafe {
+            WriteFile(
+                self.handle,
+                data.as_ptr() as *const c_void,
+                data.len() as DWORD,
+                &mut bytes_written,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if bytes_written as usize != data.len() {
+            return Err(crate::error::DiskCloneError::Other(format!(
+                "Short write: requested {} bytes, wrote {}",
+                data.len(),
+                bytes_written
+            )));
+        }
+        Ok(data.len())
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.file.flush()?;
+        if unsafe { FlushFileBuffers(self.handle) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(())
+    }
+}
+
+impl Drop for FileSink {
+    fn drop(&mut self) {
+        unsafe {
+            winapi::um::handleapi::CloseHandle(self.handle);
+        }
     }
 }
 
@@ -115,20 +168,27 @@ impl LocalDiskSink {
 
 impl ImageSink for LocalDiskSink {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
-        let mut bytes_written: DWORD = 0;
-        let ok = unsafe {
-            WriteFile(
-                self.handle,
-                data.as_ptr() as *const c_void,
-                data.len() as DWORD,
-                &mut bytes_written,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error().into());
+        let mut total_written: usize = 0;
+        while total_written < data.len() {
+            let mut bytes_written: DWORD = 0;
+            let ok = unsafe {
+                WriteFile(
+                    self.handle,
+                    data[total_written..].as_ptr() as *const c_void,
+                    (data.len() - total_written) as DWORD,
+                    &mut bytes_written,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            total_written += bytes_written as usize;
+            if bytes_written == 0 {
+                break; // avoid infinite loop
+            }
         }
-        Ok(bytes_written as usize)
+        Ok(total_written)
     }
 
     fn flush(&mut self) -> Result<()> {

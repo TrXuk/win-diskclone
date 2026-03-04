@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -12,11 +13,10 @@ use eframe::egui;
 use diskclone::{
     analyze_snapshot_support, create_ssh_session, open_shadow_in_explorer, DiagramRegion,
     DiskCloneError, FileSink, ImageBuilder, LocalDiskSink, ProgressSink, RegionSource,
-    SnapshotAnalysis, SshSink, VssSnapshot,
+    SnapshotAnalysis, SshSink, StreamRegionInfo, StreamSourceType, VssSnapshot,
 };
 
 enum WorkerMsg {
-    Total(u64),
     Status(String, bool),
     DiagramReady(Vec<DiagramRegion>, u64),
     Done,
@@ -62,6 +62,8 @@ impl Default for DiskCloneApp {
             confirm_tx: None,
             snapshot_analysis: None,
             analysis_rx: None,
+            excluded_partitions: HashSet::new(),
+            stream_status: None,
         }
     }
 }
@@ -87,6 +89,10 @@ struct DiskCloneApp {
     confirm_tx: Option<mpsc::Sender<Option<DestConfig>>>,
     snapshot_analysis: Option<Vec<SnapshotAnalysis>>,
     analysis_rx: Option<mpsc::Receiver<Result<Vec<SnapshotAnalysis>, DiskCloneError>>>,
+    /// Partition numbers to exclude from clone (write zeros instead).
+    excluded_partitions: HashSet<u32>,
+    /// Current streaming region (partition, type, path) for progress display.
+    stream_status: Option<Arc<std::sync::Mutex<StreamRegionInfo>>>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -143,6 +149,8 @@ impl DiskCloneApp {
 
         let progress = Arc::new(AtomicU64::new(0));
         self.progress = progress.clone();
+        let stream_status = Arc::new(std::sync::Mutex::new(StreamRegionInfo::default()));
+        self.stream_status = Some(stream_status.clone());
 
         let (tx, rx) = mpsc::channel();
         let (confirm_tx, confirm_rx) = mpsc::channel();
@@ -152,6 +160,7 @@ impl DiskCloneApp {
                 source,
                 progress,
                 confirm_rx,
+                stream_status,
                 |msg| {
                     let _ = tx.send(msg);
                 },
@@ -184,6 +193,7 @@ impl DiskCloneApp {
             remote_path: self.remote_path.clone(),
             local_file_path: self.local_file_path.clone(),
             target_disk: self.target_disk,
+            excluded_partitions: self.excluded_partitions.clone(),
         };
         if let Some(tx) = self.confirm_tx.take() {
             let _ = tx.send(Some(dest_config));
@@ -201,12 +211,14 @@ struct DestConfig {
     remote_path: String,
     local_file_path: String,
     target_disk: Option<u32>,
+    excluded_partitions: HashSet<u32>,
 }
 
 fn run_clone<F: Fn(WorkerMsg)>(
     source_disk: u32,
     progress: Arc<AtomicU64>,
     confirm_rx: mpsc::Receiver<Option<DestConfig>>,
+    stream_status: Arc<std::sync::Mutex<StreamRegionInfo>>,
     send: F,
 ) -> Result<u64, DiskCloneError> {
     send(WorkerMsg::Status("Creating VSS snapshot...".to_string(), true));
@@ -260,7 +272,8 @@ fn run_clone<F: Fn(WorkerMsg)>(
                 SshSink::new_cat(&sess, path)?
             };
             let mut progress_sink = ProgressSink::new(sink, progress.clone(), total_size);
-            builder.stream_to(&mut progress_sink)?
+            let mut on_fallback = |pn: u32| send(WorkerMsg::Status(format!("Partition {}: VSS returned 0 bytes, falling back to raw disk", pn), true));
+            builder.stream_to(&mut progress_sink, Some(&dest_config.excluded_partitions), Some(&stream_status), Some(&mut on_fallback))?
         }
         DestMode::LocalFile => {
             let path = if dest_config.local_file_path.is_empty() {
@@ -271,14 +284,16 @@ fn run_clone<F: Fn(WorkerMsg)>(
             send(WorkerMsg::Status(format!("Writing to {}...", path), true));
             let sink = FileSink::new(path)?;
             let mut progress_sink = ProgressSink::new(sink, progress.clone(), total_size);
-            builder.stream_to(&mut progress_sink)?
+            let mut on_fallback = |pn: u32| send(WorkerMsg::Status(format!("Partition {}: VSS returned 0 bytes, falling back to raw disk", pn), true));
+            builder.stream_to(&mut progress_sink, Some(&dest_config.excluded_partitions), Some(&stream_status), Some(&mut on_fallback))?
         }
         DestMode::LocalDisk => {
             let disk = dest_config.target_disk.unwrap_or(1);
             send(WorkerMsg::Status(format!("Writing to PhysicalDrive{}...", disk), true));
             let sink = LocalDiskSink::new(disk)?;
             let mut progress_sink = ProgressSink::new(sink, progress.clone(), total_size);
-            builder.stream_to(&mut progress_sink)?
+            let mut on_fallback = |pn: u32| send(WorkerMsg::Status(format!("Partition {}: VSS returned 0 bytes, falling back to raw disk", pn), true));
+            builder.stream_to(&mut progress_sink, Some(&dest_config.excluded_partitions), Some(&stream_status), Some(&mut on_fallback))?
         }
     };
 
@@ -312,7 +327,6 @@ impl eframe::App for DiskCloneApp {
         if let Some(rx) = self.worker_rx.take() {
             loop {
                 match rx.try_recv() {
-                    Ok(WorkerMsg::Total(t)) => self.total_bytes = t,
                     Ok(WorkerMsg::Status(s, ok)) => {
                         self.status = s;
                         self.status_ok = ok;
@@ -377,6 +391,7 @@ impl eframe::App for DiskCloneApp {
                             let new_disk = d.disk_number;
                             if self.selected_source != Some(new_disk) {
                                 self.snapshot_analysis = None;
+                                self.excluded_partitions.clear();
                                 let (tx, rx) = mpsc::channel();
                                 self.analysis_rx = Some(rx);
                                 thread::spawn(move || {
@@ -404,16 +419,23 @@ impl eframe::App for DiskCloneApp {
                         ui.collapsing("VSS snapshot analysis (before Create snapshot)", |ui| {
                             ui.label("Which partitions will get a VSS shadow:");
                             egui::Grid::new("snapshot_analysis")
-                                .num_columns(4)
+                                .num_columns(5)
                                 .striped(true)
                                 .show(ui, |ui| {
                                     ui.strong("Partition");
+                                    ui.strong("Drive");
                                     ui.strong("Size");
                                     ui.strong("Source");
                                     ui.strong("Reason");
                                     ui.end_row();
                                     for a in analysis {
                                         ui.label(format!("{}", a.partition_number));
+                                        let drive_str = if a.drive_letters.is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            a.drive_letters.join(", ")
+                                        };
+                                        ui.label(drive_str);
                                         ui.label(format!("{:.1} MB", a.size_mb));
                                         let (src, color) = if a.vss_supported {
                                             ("VSS shadow", egui::Color32::from_rgb(60, 160, 80))
@@ -451,15 +473,25 @@ impl eframe::App for DiskCloneApp {
                     for r in &self.diagram_regions {
                         let pct = (r.end - r.start) as f64 / disk_len;
                         let w = (rect.width() * pct as f32).max(2.0);
-                        let color = match &r.source {
-                            RegionSource::GptPrimary => egui::Color32::from_rgb(80, 120, 180),
-                            RegionSource::GptBackup => egui::Color32::from_rgb(60, 100, 160),
-                            RegionSource::Gap => egui::Color32::from_rgb(100, 100, 100),
-                            RegionSource::PartitionShadow { .. } => {
-                                egui::Color32::from_rgb(60, 160, 80)
-                            }
-                            RegionSource::PartitionRaw { .. } => {
-                                egui::Color32::from_rgb(180, 120, 60)
+                        let part_num = match &r.source {
+                            RegionSource::PartitionShadow { partition_num }
+                            | RegionSource::PartitionRaw { partition_num } => Some(*partition_num),
+                            _ => None,
+                        };
+                        let is_excluded = part_num.map_or(false, |pn| self.excluded_partitions.contains(&pn));
+                        let color = if is_excluded {
+                            egui::Color32::from_rgb(80, 80, 80)
+                        } else {
+                            match &r.source {
+                                RegionSource::GptPrimary => egui::Color32::from_rgb(80, 120, 180),
+                                RegionSource::GptBackup => egui::Color32::from_rgb(60, 100, 160),
+                                RegionSource::Gap => egui::Color32::from_rgb(100, 100, 100),
+                                RegionSource::PartitionShadow { .. } => {
+                                    egui::Color32::from_rgb(60, 160, 80)
+                                }
+                                RegionSource::PartitionRaw { .. } => {
+                                    egui::Color32::from_rgb(180, 120, 60)
+                                }
                             }
                         };
                         ui.painter().rect_filled(
@@ -476,12 +508,13 @@ impl eframe::App for DiskCloneApp {
                     ui.add_space(8.0);
 
                     let swatch_size = egui::vec2(16.0, 16.0);
-                    let legend_items: [(egui::Color32, &str); 5] = [
+                    let legend_items: [(egui::Color32, &str); 6] = [
                         (egui::Color32::from_rgb(80, 120, 180), "Primary GPT (raw disk)"),
                         (egui::Color32::from_rgb(60, 100, 160), "Backup GPT (raw disk)"),
                         (egui::Color32::from_rgb(100, 100, 100), "Gap (zeros)"),
                         (egui::Color32::from_rgb(60, 160, 80), "Partition from VSS shadow"),
                         (egui::Color32::from_rgb(180, 120, 60), "Partition from raw disk (MSR, etc.)"),
+                        (egui::Color32::from_rgb(80, 80, 80), "Excluded (zeros)"),
                     ];
                     for (color, label) in legend_items {
                         ui.horizontal(|ui| {
@@ -498,8 +531,39 @@ impl eframe::App for DiskCloneApp {
 
                     for r in &self.diagram_regions {
                         let size_mb = (r.end - r.start) as f64 / 1024.0 / 1024.0;
+                        let part_num = match &r.source {
+                            RegionSource::PartitionShadow { partition_num }
+                            | RegionSource::PartitionRaw { partition_num } => Some(*partition_num),
+                            _ => None,
+                        };
+                        let drive_str = part_num
+                            .and_then(|pn| {
+                                self.snapshot_analysis
+                                    .as_ref()
+                                    .and_then(|a| a.iter().find(|x| x.partition_number == pn))
+                                    .map(|a| {
+                                        if a.drive_letters.is_empty() {
+                                            "".to_string()
+                                        } else {
+                                            format!(" [{}]", a.drive_letters.join(", "))
+                                        }
+                                    })
+                            })
+                            .unwrap_or_default();
                         ui.horizontal(|ui| {
-                            ui.label(format!("  {} ({:.1} MB)", r.label, size_mb));
+                            if let Some(pn) = part_num {
+                                let mut include = !self.excluded_partitions.contains(&pn);
+                                if ui.checkbox(&mut include, "Include").changed() {
+                                    if include {
+                                        self.excluded_partitions.remove(&pn);
+                                    } else {
+                                        self.excluded_partitions.insert(pn);
+                                    }
+                                }
+                            } else {
+                                ui.add_space(60.0);
+                            }
+                            ui.label(format!("  {}{} ({:.1} MB)", r.label, drive_str, size_mb));
                             if let Some(ref path) = r.shadow_path {
                                 if ui.button("Browse shadow copy").clicked() {
                                     if let Err(e) = open_shadow_in_explorer(path) {
@@ -607,18 +671,43 @@ impl eframe::App for DiskCloneApp {
                                 drop(self.confirm_tx.take());
                                 self.phase = Phase::Idle;
                                 self.diagram_regions.clear();
+                                self.excluded_partitions.clear();
                             }
                         });
                     }
                     Phase::CreatingSnapshot | Phase::Streaming => {
                         ui.spinner();
                         ui.label(&self.status);
+                        if let Some(ref st) = self.stream_status {
+                            if let Ok(info) = st.lock() {
+                                let part_str = info
+                                    .partition_num
+                                    .map(|n| format!("Partition {} — ", n))
+                                    .unwrap_or_default();
+                                let source_str = match info.source_type {
+                                    StreamSourceType::PrimaryGpt => "Primary GPT",
+                                    StreamSourceType::BackupGpt => "Backup GPT",
+                                    StreamSourceType::Gap => "Gap (zeros)",
+                                    StreamSourceType::PartitionVss => "VSS shadow",
+                                    StreamSourceType::PartitionRaw => "Raw disk",
+                                    StreamSourceType::PartitionExcluded => "Excluded (zeros)",
+                                };
+                                let path_str = info
+                                    .path
+                                    .as_ref()
+                                    .map(|p| format!(" from {}", p))
+                                    .unwrap_or_default();
+                                if self.phase == Phase::Streaming {
+                                    ui.label(format!("{}{}{}", part_str, source_str, path_str));
+                                }
+                            }
+                        }
                         let written = self.progress.load(Ordering::Relaxed);
                         if self.total_bytes > 0 {
                             let pct = (written as f32 / self.total_bytes as f32) * 100.0;
                             ui.add(
                                 egui::ProgressBar::new(pct / 100.0)
-                                    .text(format!("{:.1}% ({:.1} GB / {:.1} GB)", pct, written as f64 / 1e9, self.total_bytes as f64 / 1e9)),
+                                    .text(format!("{:.1}% ({:.1} GB / {:.1} GB)", pct, written as f64 / 1024.0 / 1024.0 / 1024.0, self.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0)),
                             );
                         }
                     }
@@ -627,6 +716,7 @@ impl eframe::App for DiskCloneApp {
                         if ui.button("Clone another").clicked() {
                             self.phase = Phase::Idle;
                             self.status.clear();
+                            self.stream_status = None;
                         }
                     }
                     Phase::Error => {

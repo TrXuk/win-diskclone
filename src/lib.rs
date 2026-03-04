@@ -23,7 +23,9 @@ pub use disk::{
 };
 pub use error::{DiskCloneError, Result};
 pub use diagram::{build_diagram_regions, format_diagram_ascii, DiagramRegion, RegionSource};
-pub use image_builder::ImageBuilder;
+pub use image_builder::{ImageBuilder, StreamRegionInfo, StreamSourceType};
 pub use local_sink::{FileSink, LocalDiskSink, ProgressSink};
 pub use ssh_sink::{create_ssh_session, SshSink};
-pub use vss::{analyze_snapshot_support, open_shadow_in_explorer, SnapshotAnalysis, VssSnapshot};
+pub use vss::{
+    analyze_snapshot_support, debug_vss_diag, open_shadow_in_explorer, SnapshotAnalysis, VssSnapshot,
+};

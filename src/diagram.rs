@@ -158,7 +158,7 @@ pub fn format_diagram_ascii(regions: &[DiagramRegion], disk_length: u64) -> Stri
         let end_pct = (region.end as f64 / disk_length as f64) * 100.0;
         let bar_start = ((start_pct / 100.0) * width as f64) as u64;
         let bar_end = ((end_pct / 100.0) * width as f64).ceil() as u64;
-        let bar_len = (bar_end - bar_start).max(1);
+        let _bar_len = (bar_end - bar_start).max(1);
 
         let (ch, desc) = match &region.source {
             RegionSource::GptPrimary => ('G', "GPT primary".to_string()),
